@@ -1,0 +1,283 @@
+//! Compute k-shortest paths using [Yen's search
+//! algorithm](https://en.wikipedia.org/wiki/Yen%27s_algorithm).
+use num_traits::Zero;
+use rustc_hash::FxHashSet;
+use std::cmp::Ordering;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+use std::hash::Hash;
+
+use super::dijkstra::dijkstra_internal;
+
+/// A representation of a path.
+#[derive(Eq, PartialEq, Debug)]
+struct Path<N: Eq + Hash + Clone, C: Zero + Ord + Copy> {
+    /// The nodes along the path
+    nodes: Vec<N>,
+    /// The total cost of the path
+    cost: C,
+    /// Index of the node at which this path leaves the path it was derived from. Every
+    /// deviation before that point belongs to an ancestor and has already been considered.
+    spur_index: usize,
+}
+
+impl<N, C> PartialOrd for Path<N, C>
+where
+    N: Eq + Hash + Clone,
+    C: Zero + Ord + Copy,
+{
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<N, C> Ord for Path<N, C>
+where
+    N: Eq + Hash + Clone,
+    C: Zero + Ord + Copy,
+{
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Compare costs first, then amount of nodes
+        let cmp = self.cost.cmp(&other.cost);
+        match cmp {
+            Ordering::Equal => self.nodes.len().cmp(&other.nodes.len()),
+            _ => cmp,
+        }
+    }
+}
+/// Compute the k-shortest paths using the [Yen's search
+/// algorithm](https://en.wikipedia.org/wiki/Yen%27s_algorithm).
+///
+/// The `k`-shortest paths starting from `start` up to a node for which `success` returns `true`
+/// are computed along with their total cost. The result is return as a vector of (path, cost).
+///
+/// - `start` is the starting node.
+/// - `successors` returns a list of successors for a given node, along with the cost of moving from
+///   the node to the successor. Costs MUST be positive.
+/// - `success` checks weather the goal has been reached.
+/// - `k` is the amount of paths requests, including the shortest one.
+///
+/// The returned paths include both the start and the end node and are ordered by their costs
+/// starting with the lowest cost. If there exist less paths than requested, only the existing
+/// ones (if any) are returned.
+///
+/// # Example
+/// We will search the 3 shortest paths from node C to node H. See
+/// <https://en.wikipedia.org/wiki/Yen's_algorithm#Example> for a visualization.
+///
+/// ```
+/// use pathfinding::prelude::yen;
+/// // Find 3 shortest paths from 'c' to 'h'
+/// let paths = yen(
+///     &'c',
+///     |c| match c {
+///         'c' => vec![('d', 3), ('e', 2)],
+///         'd' => vec![('f', 4)],
+///         'e' => vec![('d', 1), ('f', 2), ('g', 3)],
+///         'f' => vec![('g', 2), ('h', 1)],
+///         'g' => vec![('h', 2)],
+///         'h' => vec![],
+///         _ => panic!(""),
+///         },
+///         |c| *c == 'h',
+/// 3);
+/// assert_eq!(paths.len(), 3);
+/// assert_eq!(paths[0], (vec!['c', 'e', 'f', 'h'], 5));
+/// assert_eq!(paths[1], (vec!['c', 'e', 'g', 'h'], 7));
+/// assert_eq!(paths[2], (vec!['c', 'd', 'f', 'h'], 8));
+///
+/// // An example of a graph that has no path from 'c' to 'h'.
+/// let empty = yen(
+///     &'c',
+///     |c| match c {
+///         'c' => vec![('d', 3)],
+///         'd' => vec![],
+///         _ => panic!(""),
+///     },
+///     |c| *c == 'h',
+///     2);
+/// assert!(empty.is_empty());
+/// ```
+///
+/// # Parallel edges
+///
+/// A path is a sequence of nodes, so two routes differing only in which of several edges
+/// between the same pair of nodes they take are the same path. Where more than one edge joins
+/// two nodes, the cheaper one is the one taken, and the others are never reported: on the graph
+/// below there is one path from `A` to `B`, not two, and asking for `k = 2` returns one.
+///
+/// ```
+/// use pathfinding::prelude::yen;
+///
+/// let two_roads = |c: &char| match c {
+///     'A' => vec![('B', 3), ('B', 2)],
+///     _ => vec![],
+/// };
+/// let routes = yen(&'A', two_roads, |c| *c == 'B', 2);
+/// assert_eq!(routes, vec![(vec!['A', 'B'], 2)]);
+/// ```
+///
+/// When the edges themselves matter, put enough into the node to tell them apart. Carrying the
+/// edge a node was reached by makes the two routes different paths, and both are then found:
+///
+/// ```
+/// use pathfinding::prelude::yen;
+///
+/// // Two roads from A to B, costing 3 and 2. A node is a town plus the road reached it by,
+/// // which the starting town has none of.
+/// let roads = [('A', 'B', 3), ('A', 'B', 2)];
+/// let successors = |&(town, _): &(char, Option<usize>)| {
+///     roads
+///         .iter()
+///         .enumerate()
+///         .filter(move |(_, (from, _, _))| *from == town)
+///         .map(|(road, &(_, to, cost))| ((to, Some(road)), cost))
+///         .collect::<Vec<_>>()
+/// };
+///
+/// let routes = yen(&('A', None), successors, |&(town, _)| town == 'B', 2);
+/// assert_eq!(routes.len(), 2);
+/// assert_eq!(routes[0], (vec![('A', None), ('B', Some(1))], 2));
+/// assert_eq!(routes[1], (vec![('A', None), ('B', Some(0))], 3));
+/// ```
+pub fn yen<N, C, FN, IN, FS>(
+    start: &N,
+    mut successors: FN,
+    mut success: FS,
+    k: usize,
+) -> Vec<(Vec<N>, C)>
+where
+    N: Eq + Hash + Clone,
+    C: Zero + Ord + Copy,
+    FN: FnMut(&N) -> IN,
+    IN: IntoIterator<Item = (N, C)>,
+    FS: FnMut(&N) -> bool,
+{
+    if k == 0 {
+        return vec![];
+    }
+    let Some((n, c)) = dijkstra_internal(start, &mut successors, &mut success) else {
+        return vec![];
+    };
+
+    let mut visited = FxHashSet::default();
+    // A vector containing our paths.
+    let mut routes = vec![Path {
+        nodes: n,
+        cost: c,
+        spur_index: 0,
+    }];
+    // A min-heap to store our lowest-cost route candidate
+    let mut k_routes = BinaryHeap::new();
+    for ki in 0..(k - 1) {
+        if routes.len() <= ki || routes.len() == k {
+            // We have no more routes to explore, or we have found enough.
+            break;
+        }
+        // Cost of each prefix of the route being explored, so that the cost of a spur path can
+        // be added to the cost of its root path rather than recomputed from the graph.
+        let root_costs = prefix_costs(&routes[ki].nodes, &mut successors);
+        // Deviating before the point where this route left its own parent would rebuild a
+        // candidate that was already produced while exploring that parent.
+        let first_spur = routes[ki].spur_index;
+        // Take the most recent route to explore new spurs.
+        let previous = &routes[ki].nodes;
+        // Iterate over every node except the sink node.
+        for i in first_spur..(previous.len() - 1) {
+            let spur_node = &previous[i];
+            let root_path = &previous[0..i];
+
+            let mut filtered_edges = FxHashSet::default();
+            for path in &routes {
+                if path.nodes.len() > i + 1
+                    && &path.nodes[0..i] == root_path
+                    && &path.nodes[i] == spur_node
+                {
+                    filtered_edges.insert((&path.nodes[i], &path.nodes[i + 1]));
+                }
+            }
+            let filtered_nodes: FxHashSet<&N> = FxHashSet::from_iter(root_path);
+            // We are creating a new successor function that will not return the
+            // filtered edges and nodes that routes already used.
+            let mut filtered_successor = |n: &N| {
+                successors(n)
+                    .into_iter()
+                    .filter(|(n2, _)| {
+                        !filtered_nodes.contains(&n2) && !filtered_edges.contains(&(n, n2))
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            // Let us find the spur path from the spur node to the sink using.
+            if let Some((spur_path, spur_cost)) =
+                dijkstra_internal(spur_node, &mut filtered_successor, &mut success)
+            {
+                let nodes: Vec<N> = root_path.iter().cloned().chain(spur_path).collect();
+                // If we have found the same path before, we will not add it.
+                if !visited.contains(&nodes) {
+                    // Mark as visited
+                    visited.insert(nodes.clone());
+                    // Build a min-heap
+                    k_routes.push(Reverse(Path {
+                        nodes,
+                        cost: root_costs[i] + spur_cost,
+                        spur_index: i,
+                    }));
+                }
+            }
+        }
+        if let Some(k_route) = k_routes.pop() {
+            let route = k_route.0;
+            let cost = route.cost;
+            routes.push(route);
+            // If we have other potential best routes with the same cost, we can insert
+            // them in the found routes since we will not find a better alternative.
+            while routes.len() < k {
+                let Some(k_route) = k_routes.peek() else {
+                    break;
+                };
+                if k_route.0.cost == cost {
+                    let Some(k_route) = k_routes.pop() else {
+                        break; // Cannot break
+                    };
+                    routes.push(k_route.0);
+                } else {
+                    break; // Other routes have higher cost
+                }
+            }
+        }
+    }
+
+    routes.sort_unstable();
+    routes
+        .into_iter()
+        .map(|Path { nodes, cost, .. }| (nodes, cost))
+        .collect()
+}
+
+/// Compute the cost of every prefix of `nodes`: entry `i` is the cost of walking `nodes[..=i]`,
+/// so entry `0` is zero and the last entry is the cost of the whole path.
+///
+/// Where several edges join the same two nodes, a shortest path uses the cheapest of them.
+fn prefix_costs<N, FN, IN, C>(nodes: &[N], successors: &mut FN) -> Vec<C>
+where
+    N: Eq,
+    C: Zero + Ord + Copy,
+    FN: FnMut(&N) -> IN,
+    IN: IntoIterator<Item = (N, C)>,
+{
+    let mut costs = Vec::with_capacity(nodes.len());
+    let mut total = C::zero();
+    costs.push(total);
+    for edge in nodes.windows(2) {
+        let step = successors(&edge[0])
+            .into_iter()
+            .filter(|(n, _)| *n == edge[1])
+            .map(|(_, c)| c)
+            .min()
+            .unwrap_or_else(C::zero);
+        total = total + step;
+        costs.push(total);
+    }
+    costs
+}
